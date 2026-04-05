@@ -823,6 +823,15 @@ struct perf_event {
 	u64				total_time_running;
 	u64				tstamp;
 
+	/*
+	 * Refclock-based time tracking: same semantics as total_time_enabled
+	 * and total_time_running, but measured in privilege-filtered reference
+	 * clock ticks instead of wall-clock nanoseconds.
+	 */
+	u64				total_refclock_time_enabled;
+	u64				total_refclock_time_running;
+	u64				refclock_tstamp;
+
 	struct perf_event_attr		attr;
 	u16				header_size;
 	u16				id_header_size;
@@ -844,6 +853,8 @@ struct perf_event {
 	 */
 	atomic64_t			child_total_time_enabled;
 	atomic64_t			child_total_time_running;
+	atomic64_t			child_total_refclock_time_enabled;
+	atomic64_t			child_total_refclock_time_running;
 
 	/*
 	 * Protect attach/detach and child_list:
@@ -1050,6 +1061,16 @@ struct perf_event_context {
 	struct perf_time_ctx		timeguest;
 
 	/*
+	 * Privilege-filtered reference clock.  A user-created pinned event
+	 * with attr.reference=1 serves as the timebase.  Other events in
+	 * the context with PERF_FORMAT_REFCLOCK_TIME_ENABLED/RUNNING
+	 * derive their refclock times from this.
+	 */
+	struct perf_event		*refclock;
+	struct perf_time_ctx		refclock_time;
+	struct perf_time_ctx		refclock_timeguest;
+
+	/*
 	 * These fields let us detect when two contexts have both
 	 * been cloned (inherited) from a common ancestor.
 	 */
@@ -1182,6 +1203,8 @@ struct bpf_perf_event_data_kern {
 struct perf_cgroup_info {
 	struct perf_time_ctx		time;
 	struct perf_time_ctx		timeguest;
+	struct perf_time_ctx		refclock_time;
+	struct perf_time_ctx		refclock_timeguest;
 	int				active;
 };
 

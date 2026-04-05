@@ -694,8 +694,57 @@ static atomic64_t perf_event_id;
 
 static void update_context_time(struct perf_event_context *ctx);
 static u64 perf_event_time(struct perf_event *event);
+static inline int is_cgroup_event(struct perf_event *event);
+static inline u64 __perf_event_time_ctx(struct perf_event *event,
+					struct perf_time_ctx *times);
+static inline u64 __perf_event_time_ctx_now(struct perf_event *event,
+					    struct perf_time_ctx *times,
+					    u64 now);
 
 void __weak perf_event_print_debug(void)	{ }
+
+/*
+ * UP store-release, load-acquire
+ */
+
+#define __store_release(ptr, val)					\
+do {									\
+	barrier();							\
+	WRITE_ONCE(*(ptr), (val));					\
+} while (0)
+
+#define __load_acquire(ptr)						\
+({									\
+	__unqual_scalar_typeof(*(ptr)) ___p = READ_ONCE(*(ptr));	\
+	barrier();							\
+	___p;								\
+})
+
+#define PERF_FORMAT_REFCLOCK_TIMES (PERF_FORMAT_REFCLOCK_TIME_ENABLED | \
+				    PERF_FORMAT_REFCLOCK_TIME_RUNNING)
+
+static inline bool perf_event_uses_refclock(struct perf_event *event)
+{
+	return event->ctx && READ_ONCE(event->ctx->refclock) &&
+	       (event->attr.read_format & PERF_FORMAT_REFCLOCK_TIMES);
+}
+
+/*
+ * Read the refclock event's current count.  The refclock is a pinned
+ * hardware event; if it's active on this CPU, pmu->read() updates its
+ * count.  Returns true and writes the value to @val if successful.
+ */
+static bool perf_refclock_read(struct perf_event_context *ctx, u64 *val)
+{
+	struct perf_event *rc = READ_ONCE(ctx->refclock);
+
+	if (!rc || READ_ONCE(rc->state) != PERF_EVENT_STATE_ACTIVE)
+		return false;
+
+	rc->pmu->read(rc);
+	*val = local64_read(&rc->count);
+	return true;
+}
 
 static inline u64 perf_clock(void)
 {
@@ -740,17 +789,20 @@ __perf_effective_state(struct perf_event *event)
 	return event->state;
 }
 
+/*
+ * Add the elapsed delta since @tstamp to *@enabled and *@running, gated
+ * by the event's effective state.  Callers must pre-load the base values.
+ */
 static __always_inline void
-__perf_update_times(struct perf_event *event, u64 now, u64 *enabled, u64 *running)
+__perf_update_times(struct perf_event *event, u64 now, u64 tstamp,
+		    u64 *enabled, u64 *running)
 {
 	enum perf_event_state state = __perf_effective_state(event);
-	u64 delta = now - event->tstamp;
+	u64 delta = now - tstamp;
 
-	*enabled = event->total_time_enabled;
 	if (state >= PERF_EVENT_STATE_INACTIVE)
 		*enabled += delta;
 
-	*running = event->total_time_running;
 	if (state >= PERF_EVENT_STATE_ACTIVE)
 		*running += delta;
 }
@@ -759,17 +811,77 @@ static void perf_event_update_time(struct perf_event *event)
 {
 	u64 now = perf_event_time(event);
 
-	__perf_update_times(event, now, &event->total_time_enabled,
-					&event->total_time_running);
+	__perf_update_times(event, now, event->tstamp,
+			    &event->total_time_enabled,
+			    &event->total_time_running);
 	event->tstamp = now;
+}
+
+static u64 perf_event_refclock_time(struct perf_event *event)
+{
+#ifdef CONFIG_CGROUP_PERF
+	if (is_cgroup_event(event)) {
+		struct perf_cgroup_info *info;
+
+		info = per_cpu_ptr(event->cgrp->info, event->cpu);
+		return __perf_event_time_ctx(event, &info->refclock_time);
+	}
+#endif
+	return __perf_event_time_ctx(event, &event->ctx->refclock_time);
+}
+
+/*
+ * NMI-safe refclock time read using the precomputed offset.
+ * Returns 0 if the refclock is not available.
+ */
+static u64 perf_event_refclock_time_now(struct perf_event *event)
+{
+	struct perf_event_context *ctx = event->ctx;
+	struct perf_time_ctx *rc_times;
+	u64 rc_now;
+
+	if (!ctx || !READ_ONCE(ctx->refclock))
+		return 0;
+
+#ifdef CONFIG_CGROUP_PERF
+	if (is_cgroup_event(event))
+		rc_times = &per_cpu_ptr(event->cgrp->info, event->cpu)->refclock_time;
+	else
+#endif
+		rc_times = &ctx->refclock_time;
+
+	if (!(__load_acquire(&ctx->is_active) & EVENT_TIME))
+		return __perf_event_time_ctx(event, rc_times);
+
+	if (!perf_refclock_read(ctx, &rc_now))
+		return __perf_event_time_ctx(event, rc_times);
+
+	return __perf_event_time_ctx_now(event, rc_times, rc_now);
+}
+
+static void perf_event_update_refclock_time(struct perf_event *event)
+{
+	u64 now;
+
+	if (!perf_event_uses_refclock(event))
+		return;
+
+	now = perf_event_refclock_time(event);
+
+	__perf_update_times(event, now, event->refclock_tstamp,
+			    &event->total_refclock_time_enabled,
+			    &event->total_refclock_time_running);
+	event->refclock_tstamp = now;
 }
 
 static void perf_event_update_sibling_time(struct perf_event *leader)
 {
 	struct perf_event *sibling;
 
-	for_each_sibling_event(sibling, leader)
+	for_each_sibling_event(sibling, leader) {
 		perf_event_update_time(sibling);
+		perf_event_update_refclock_time(sibling);
+	}
 }
 
 static void
@@ -779,6 +891,7 @@ perf_event_set_state(struct perf_event *event, enum perf_event_state state)
 		return;
 
 	perf_event_update_time(event);
+	perf_event_update_refclock_time(event);
 	/*
 	 * If a group leader gets enabled/disabled all its siblings
 	 * are affected too.
@@ -788,23 +901,6 @@ perf_event_set_state(struct perf_event *event, enum perf_event_state state)
 
 	WRITE_ONCE(event->state, state);
 }
-
-/*
- * UP store-release, load-acquire
- */
-
-#define __store_release(ptr, val)					\
-do {									\
-	barrier();							\
-	WRITE_ONCE(*(ptr), (val));					\
-} while (0)
-
-#define __load_acquire(ptr)						\
-({									\
-	__unqual_scalar_typeof(*(ptr)) ___p = READ_ONCE(*(ptr));	\
-	barrier();							\
-	___p;								\
-})
 
 static bool perf_skip_pmu_ctx(struct perf_event_pmu_context *pmu_ctx,
 			      enum event_type_t event_type)
@@ -866,6 +962,14 @@ static inline void update_perf_time_ctx(struct perf_time_ctx *time, u64 now, boo
 
 static_assert(offsetof(struct perf_event_context, timeguest) -
 	      offsetof(struct perf_event_context, time) ==
+	      sizeof(struct perf_time_ctx));
+
+static_assert(offsetof(struct perf_event_context, refclock_timeguest) -
+	      offsetof(struct perf_event_context, refclock_time) ==
+	      sizeof(struct perf_time_ctx));
+
+static_assert(offsetof(struct perf_cgroup_info, refclock_timeguest) -
+	      offsetof(struct perf_cgroup_info, refclock_time) ==
 	      sizeof(struct perf_time_ctx));
 
 #define T_TOTAL		0
@@ -956,16 +1060,29 @@ static inline u64 perf_cgroup_event_time_now(struct perf_event *event, u64 now)
 	return __perf_event_time_ctx_now(event, &t->time, now);
 }
 
-static inline void __update_cgrp_guest_time(struct perf_cgroup_info *info, u64 now, bool adv)
+static inline void __update_cgrp_guest_time(struct perf_cgroup_info *info,
+					    u64 now, bool adv)
 {
 	update_perf_time_ctx(&info->timeguest, now, adv);
 }
 
-static inline void update_cgrp_time(struct perf_cgroup_info *info, u64 now)
+static inline void __update_cgrp_refclock_guest_time(struct perf_cgroup_info *info,
+						     u64 now, bool adv)
+{
+	update_perf_time_ctx(&info->refclock_timeguest, now, adv);
+}
+
+static inline void update_cgrp_time(struct perf_cgroup_info *info,
+				    u64 now, u64 rc_now, bool rc_valid)
 {
 	update_perf_time_ctx(&info->time, now, true);
-	if (is_guest_mediated_pmu_loaded())
+	if (rc_valid)
+		update_perf_time_ctx(&info->refclock_time, rc_now, true);
+	if (is_guest_mediated_pmu_loaded()) {
 		__update_cgrp_guest_time(info, now, true);
+		if (rc_valid)
+			__update_cgrp_refclock_guest_time(info, rc_now, true);
+	}
 }
 
 static inline void update_cgrp_time_from_cpuctx(struct perf_cpu_context *cpuctx, bool final)
@@ -976,12 +1093,14 @@ static inline void update_cgrp_time_from_cpuctx(struct perf_cpu_context *cpuctx,
 
 	if (cgrp) {
 		u64 now = perf_clock();
+		u64 rc_now;
+		bool rc_valid = perf_refclock_read(&cpuctx->ctx, &rc_now);
 
 		for (css = &cgrp->css; css; css = css->parent) {
 			cgrp = container_of(css, struct perf_cgroup, css);
 			info = this_cpu_ptr(cgrp->info);
 
-			update_cgrp_time(info, now);
+			update_cgrp_time(info, now, rc_now, rc_valid);
 			if (final)
 				__store_release(&info->active, 0);
 		}
@@ -1003,8 +1122,13 @@ static inline void update_cgrp_time_from_event(struct perf_event *event)
 	/*
 	 * Do not update time when cgroup is not active
 	 */
-	if (info->active)
-		update_cgrp_time(info, perf_clock());
+	if (info->active) {
+		u64 now = perf_clock();
+		u64 rc_now;
+		bool rc_valid = perf_refclock_read(event->ctx, &rc_now);
+
+		update_cgrp_time(info, now, rc_now, rc_valid);
+	}
 }
 
 static inline void
@@ -1030,8 +1154,19 @@ perf_cgroup_set_timestamp(struct perf_cpu_context *cpuctx, bool guest)
 		info = this_cpu_ptr(cgrp->info);
 		if (guest) {
 			__update_cgrp_guest_time(info, ctx->time.stamp, false);
+			if (ctx->refclock)
+				__update_cgrp_refclock_guest_time(info,
+						ctx->refclock_time.stamp, false);
 		} else {
 			update_perf_time_ctx(&info->time, ctx->time.stamp, false);
+			if (ctx->refclock)
+				update_perf_time_ctx(&info->refclock_time,
+						     ctx->refclock_time.stamp,
+						     false);
+			__update_cgrp_guest_time(info, ctx->time.stamp, false);
+			if (ctx->refclock)
+				__update_cgrp_refclock_guest_time(info,
+						ctx->refclock_time.stamp, false);
 			__store_release(&info->active, 1);
 		}
 	}
@@ -1644,9 +1779,6 @@ static void perf_unpin_context(struct perf_event_context *ctx)
 	raw_spin_unlock_irqrestore(&ctx->lock, flags);
 }
 
-/*
- * Update the record of the current time in a context.
- */
 static void __update_context_time(struct perf_event_context *ctx, bool adv)
 {
 	lockdep_assert_held(&ctx->lock);
@@ -1654,19 +1786,46 @@ static void __update_context_time(struct perf_event_context *ctx, bool adv)
 	update_perf_time_ctx(&ctx->time, perf_clock(), adv);
 }
 
+static void __update_context_refclock_time(struct perf_event_context *ctx, bool adv)
+{
+	u64 rc_now;
+
+	lockdep_assert_held(&ctx->lock);
+
+	if (!perf_refclock_read(ctx, &rc_now))
+		return;
+
+	update_perf_time_ctx(&ctx->refclock_time, rc_now, adv);
+}
+
 static void __update_context_guest_time(struct perf_event_context *ctx, bool adv)
 {
 	lockdep_assert_held(&ctx->lock);
 
-	/* must be called after __update_context_time(); */
+	/* must be called after __update_context_time() */
 	update_perf_time_ctx(&ctx->timeguest, ctx->time.stamp, adv);
+}
+
+static void __update_context_refclock_guest_time(struct perf_event_context *ctx, bool adv)
+{
+	lockdep_assert_held(&ctx->lock);
+
+	if (!READ_ONCE(ctx->refclock))
+		return;
+
+	/* must be called after __update_context_refclock_time() */
+	update_perf_time_ctx(&ctx->refclock_timeguest,
+			     ctx->refclock_time.stamp, adv);
 }
 
 static void update_context_time(struct perf_event_context *ctx)
 {
 	__update_context_time(ctx, true);
-	if (is_guest_mediated_pmu_loaded())
+	__update_context_refclock_time(ctx, true);
+	if (is_guest_mediated_pmu_loaded()) {
 		__update_context_guest_time(ctx, true);
+		__update_context_refclock_guest_time(ctx, true);
+	}
 }
 
 static u64 perf_event_time(struct perf_event *event)
@@ -2027,6 +2186,12 @@ static int __perf_event_read_size(u64 read_format, int nr_siblings)
 		size += sizeof(u64);
 
 	if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
+		size += sizeof(u64);
+
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_ENABLED)
+		size += sizeof(u64);
+
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_RUNNING)
 		size += sizeof(u64);
 
 	if (read_format & PERF_FORMAT_ID)
@@ -2470,6 +2635,14 @@ event_sched_out(struct perf_event *event, struct perf_event_context *ctx)
 	 */
 	list_del_init(&event->active_list);
 
+	/*
+	 * Clear ctx->refclock before pmu->del() so that NMI-context
+	 * readers (perf_refclock_read) don't call pmu->read() on an
+	 * event that has been removed from hardware.
+	 */
+	if (event->attr.reference && READ_ONCE(ctx->refclock) == event)
+		WRITE_ONCE(ctx->refclock, NULL);
+
 	perf_pmu_disable(event->pmu);
 
 	event->pmu->del(event, 0);
@@ -2812,6 +2985,13 @@ event_sched_in(struct perf_event *event, struct perf_event_context *ctx)
 	if (event->state <= PERF_EVENT_STATE_OFF)
 		return 0;
 
+	/*
+	 * Only one reference event can serve as the refclock at a time.
+	 * Check before pmu->add() to avoid rollback complexity.
+	 */
+	if (event->attr.reference && ctx->refclock && ctx->refclock != event)
+		return -EAGAIN;
+
 	WRITE_ONCE(event->oncpu, smp_processor_id());
 	/*
 	 * Order event::oncpu write to happen before the ACTIVE state is
@@ -2848,6 +3028,15 @@ event_sched_in(struct perf_event *event, struct perf_event_context *ctx)
 	}
 	if (event->attr.exclusive)
 		cpc->exclusive = 1;
+
+	/*
+	 * Set ctx->refclock and establish the baseline now that pmu->add()
+	 * has placed the counter on hardware (pmu->read() requires this).
+	 */
+	if (event->attr.reference) {
+		WRITE_ONCE(ctx->refclock, event);
+		__update_context_refclock_time(ctx, false);
+	}
 
 out:
 	perf_pmu_enable(event->pmu);
@@ -3636,6 +3825,7 @@ ctx_sched_out(struct perf_event_context *ctx, struct pmu *pmu, enum event_type_t
 		 */
 		is_active = EVENT_ALL;
 		__update_context_guest_time(ctx, false);
+		__update_context_refclock_guest_time(ctx, false);
 		perf_cgroup_set_timestamp(cpuctx, true);
 		barrier();
 	} else {
@@ -3702,6 +3892,7 @@ static void __perf_event_sync_stat(struct perf_event *event,
 	perf_pmu_read(event);
 
 	perf_event_update_time(event);
+	perf_event_update_refclock_time(event);
 
 	/*
 	 * In order to keep per-task stats reliable we need to flip the event
@@ -3713,6 +3904,10 @@ static void __perf_event_sync_stat(struct perf_event *event,
 
 	swap(event->total_time_enabled, next_event->total_time_enabled);
 	swap(event->total_time_running, next_event->total_time_running);
+	swap(event->total_refclock_time_enabled,
+	     next_event->total_refclock_time_enabled);
+	swap(event->total_refclock_time_running,
+	     next_event->total_refclock_time_running);
 
 	/*
 	 * Since we swizzled the values, update the user visible data too.
@@ -4192,7 +4387,12 @@ ctx_sched_in(struct perf_event_context *ctx, struct pmu *pmu, enum event_type_t 
 	if (!(is_active & EVENT_TIME)) {
 		/* EVENT_TIME should be active while the guest runs */
 		WARN_ON_ONCE(event_type & EVENT_GUEST);
-		/* start ctx time */
+		/*
+		 * Start ctx time.  No refclock baseline here — the
+		 * reference event is not yet on hardware.  The refclock
+		 * baseline is established in event_sched_in() after
+		 * pmu->add() succeeds.
+		 */
 		__update_context_time(ctx, false);
 		perf_cgroup_set_timestamp(cpuctx, false);
 		/*
@@ -4829,6 +5029,7 @@ static void __perf_event_read(void *info)
 	ctx_time_update_event(ctx, event);
 
 	perf_event_update_time(event);
+	perf_event_update_refclock_time(event);
 	if (data->group)
 		perf_event_update_sibling_time(event);
 
@@ -4868,7 +5069,22 @@ static void calc_timer_values(struct perf_event *event,
 
 	*now = perf_clock();
 	ctx_time = perf_event_time_now(event, *now);
-	__perf_update_times(event, ctx_time, enabled, running);
+	*enabled = event->total_time_enabled;
+	*running = event->total_time_running;
+	__perf_update_times(event, ctx_time, event->tstamp, enabled, running);
+}
+
+static void calc_refclock_timer_values(struct perf_event *event,
+				       u64 *enabled,
+				       u64 *running)
+{
+	u64 rc_time = perf_event_refclock_time_now(event);
+
+	*enabled = event->total_refclock_time_enabled;
+	*running = event->total_refclock_time_running;
+	if (rc_time)
+		__perf_update_times(event, rc_time, event->refclock_tstamp,
+				    enabled, running);
 }
 
 /*
@@ -5019,6 +5235,7 @@ again:
 		ctx_time_update_event(ctx, event);
 
 		perf_event_update_time(event);
+		perf_event_update_refclock_time(event);
 		if (group)
 			perf_event_update_sibling_time(event);
 		raw_spin_unlock_irqrestore(&ctx->lock, flags);
@@ -6031,7 +6248,8 @@ static int perf_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
+static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running,
+				   u64 *rc_enabled, u64 *rc_running)
 {
 	struct perf_event *child;
 	u64 total = 0;
@@ -6049,11 +6267,22 @@ static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *
 	*running += event->total_time_running +
 			atomic64_read(&event->child_total_time_running);
 
+	if (rc_enabled) {
+		*rc_enabled = event->total_refclock_time_enabled +
+			atomic64_read(&event->child_total_refclock_time_enabled);
+		*rc_running = event->total_refclock_time_running +
+			atomic64_read(&event->child_total_refclock_time_running);
+	}
+
 	list_for_each_entry(child, &event->child_list, child_list) {
 		(void)perf_event_read(child, false);
 		total += perf_event_count(child, false);
 		*enabled += child->total_time_enabled;
 		*running += child->total_time_running;
+		if (rc_enabled) {
+			*rc_enabled += child->total_refclock_time_enabled;
+			*rc_running += child->total_refclock_time_running;
+		}
 	}
 	mutex_unlock(&event->child_mutex);
 
@@ -6066,7 +6295,7 @@ u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
 	u64 count;
 
 	ctx = perf_event_ctx_lock(event);
-	count = __perf_event_read_value(event, enabled, running);
+	count = __perf_event_read_value(event, enabled, running, NULL, NULL);
 	perf_event_ctx_unlock(event, ctx);
 
 	return count;
@@ -6128,6 +6357,16 @@ static int __perf_read_group_add(struct perf_event *leader,
 	if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING) {
 		values[n++] += leader->total_time_running +
 			atomic64_read(&leader->child_total_time_running);
+	}
+
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_ENABLED) {
+		values[n++] += leader->total_refclock_time_enabled +
+			atomic64_read(&leader->child_total_refclock_time_enabled);
+	}
+
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_RUNNING) {
+		values[n++] += leader->total_refclock_time_running +
+			atomic64_read(&leader->child_total_refclock_time_running);
 	}
 
 	/*
@@ -6197,15 +6436,22 @@ out:
 static int perf_read_one(struct perf_event *event,
 				 u64 read_format, char __user *buf)
 {
-	u64 enabled, running;
-	u64 values[5];
+	u64 enabled, running, rc_enabled = 0, rc_running = 0;
+	u64 values[7];
 	int n = 0;
+	bool need_rc = read_format & PERF_FORMAT_REFCLOCK_TIMES;
 
-	values[n++] = __perf_event_read_value(event, &enabled, &running);
+	values[n++] = __perf_event_read_value(event, &enabled, &running,
+					      need_rc ? &rc_enabled : NULL,
+					      need_rc ? &rc_running : NULL);
 	if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
 		values[n++] = enabled;
 	if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
 		values[n++] = running;
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_ENABLED)
+		values[n++] = rc_enabled;
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_RUNNING)
+		values[n++] = rc_running;
 	if (read_format & PERF_FORMAT_ID)
 		values[n++] = primary_event_id(event);
 	if (read_format & PERF_FORMAT_LOST)
@@ -8063,10 +8309,11 @@ void perf_event__output_id_sample(struct perf_event *event,
 
 static void perf_output_read_one(struct perf_output_handle *handle,
 				 struct perf_event *event,
-				 u64 enabled, u64 running)
+				 u64 enabled, u64 running,
+				 u64 rc_enabled, u64 rc_running)
 {
 	u64 read_format = event->attr.read_format;
-	u64 values[5];
+	u64 values[7];
 	int n = 0;
 
 	values[n++] = perf_event_count(event, has_inherit_and_sample_read(&event->attr));
@@ -8078,6 +8325,14 @@ static void perf_output_read_one(struct perf_output_handle *handle,
 		values[n++] = running +
 			atomic64_read(&event->child_total_time_running);
 	}
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_ENABLED) {
+		values[n++] = rc_enabled +
+			atomic64_read(&event->child_total_refclock_time_enabled);
+	}
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_RUNNING) {
+		values[n++] = rc_running +
+			atomic64_read(&event->child_total_refclock_time_running);
+	}
 	if (read_format & PERF_FORMAT_ID)
 		values[n++] = primary_event_id(event);
 	if (read_format & PERF_FORMAT_LOST)
@@ -8088,12 +8343,13 @@ static void perf_output_read_one(struct perf_output_handle *handle,
 
 static void perf_output_read_group(struct perf_output_handle *handle,
 				   struct perf_event *event,
-				   u64 enabled, u64 running)
+				   u64 enabled, u64 running,
+				   u64 rc_enabled, u64 rc_running)
 {
 	struct perf_event *leader = event->group_leader, *sub;
 	u64 read_format = event->attr.read_format;
 	unsigned long flags;
-	u64 values[6];
+	u64 values[8];
 	int n = 0;
 	bool self = has_inherit_and_sample_read(&event->attr);
 
@@ -8110,6 +8366,12 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 
 	if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
 		values[n++] = running;
+
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_ENABLED)
+		values[n++] = rc_enabled;
+
+	if (read_format & PERF_FORMAT_REFCLOCK_TIME_RUNNING)
+		values[n++] = rc_running;
 
 	if ((leader != event) && !handle->skip_read)
 		perf_pmu_read(leader);
@@ -8158,6 +8420,7 @@ static void perf_output_read(struct perf_output_handle *handle,
 			     struct perf_event *event)
 {
 	u64 enabled = 0, running = 0, now;
+	u64 rc_enabled = 0, rc_running = 0;
 	u64 read_format = event->attr.read_format;
 
 	/*
@@ -8170,10 +8433,15 @@ static void perf_output_read(struct perf_output_handle *handle,
 	if (read_format & PERF_FORMAT_TOTAL_TIMES)
 		calc_timer_values(event, &now, &enabled, &running);
 
+	if (read_format & PERF_FORMAT_REFCLOCK_TIMES)
+		calc_refclock_timer_values(event, &rc_enabled, &rc_running);
+
 	if (event->attr.read_format & PERF_FORMAT_GROUP)
-		perf_output_read_group(handle, event, enabled, running);
+		perf_output_read_group(handle, event, enabled, running,
+				       rc_enabled, rc_running);
 	else
-		perf_output_read_one(handle, event, enabled, running);
+		perf_output_read_one(handle, event, enabled, running,
+				     rc_enabled, rc_running);
 }
 
 void perf_output_sample(struct perf_output_handle *handle,
@@ -14160,6 +14428,17 @@ SYSCALL_DEFINE5(perf_event_open,
 
 	event->owner = current;
 
+	/*
+	 * A reference event serves as the context's refclock timebase.
+	 * It must be pinned so it stays on hardware across multiplexing.
+	 * ctx->refclock is set later when the event is actually scheduled.
+	 */
+	if (event->attr.reference &&
+	    (!event->attr.pinned || event->attr.inherit)) {
+		err = -EINVAL;
+		goto err_locked;
+	}
+
 	perf_install_in_context(ctx, event, event->cpu);
 	perf_unpin_context(ctx);
 
@@ -14443,6 +14722,10 @@ static void sync_child_event(struct perf_event *child_event,
 		     &parent_event->child_total_time_enabled);
 	atomic64_add(child_event->total_time_running,
 		     &parent_event->child_total_time_running);
+	atomic64_add(child_event->total_refclock_time_enabled,
+		     &parent_event->child_total_refclock_time_enabled);
+	atomic64_add(child_event->total_refclock_time_running,
+		     &parent_event->child_total_refclock_time_running);
 }
 
 static void

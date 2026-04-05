@@ -348,6 +348,8 @@ enum {
  *	{ u64		value;
  *	  { u64		time_enabled; } && PERF_FORMAT_TOTAL_TIME_ENABLED
  *	  { u64		time_running; } && PERF_FORMAT_TOTAL_TIME_RUNNING
+ *	  { u64		refclock_time_enabled; } && PERF_FORMAT_REFCLOCK_TIME_ENABLED
+ *	  { u64		refclock_time_running; } && PERF_FORMAT_REFCLOCK_TIME_RUNNING
  *	  { u64		id;           } && PERF_FORMAT_ID
  *	  { u64		lost;         } && PERF_FORMAT_LOST
  *	} && !PERF_FORMAT_GROUP
@@ -355,6 +357,8 @@ enum {
  *	{ u64		nr;
  *	  { u64		time_enabled; } && PERF_FORMAT_TOTAL_TIME_ENABLED
  *	  { u64		time_running; } && PERF_FORMAT_TOTAL_TIME_RUNNING
+ *	  { u64		refclock_time_enabled; } && PERF_FORMAT_REFCLOCK_TIME_ENABLED
+ *	  { u64		refclock_time_running; } && PERF_FORMAT_REFCLOCK_TIME_RUNNING
  *	  { u64		value;
  *	    { u64	id;           } && PERF_FORMAT_ID
  *	    { u64	lost;         } && PERF_FORMAT_LOST
@@ -368,8 +372,10 @@ enum perf_event_read_format {
 	PERF_FORMAT_ID				= 1U << 2,
 	PERF_FORMAT_GROUP			= 1U << 3,
 	PERF_FORMAT_LOST			= 1U << 4,
+	PERF_FORMAT_REFCLOCK_TIME_ENABLED	= 1U << 5,
+	PERF_FORMAT_REFCLOCK_TIME_RUNNING	= 1U << 6,
 
-	PERF_FORMAT_MAX = 1U << 5,		/* non-ABI */
+	PERF_FORMAT_MAX = 1U << 7,		/* non-ABI */
 };
 
 #define PERF_ATTR_SIZE_VER0			 64	/* Size of first published 'struct perf_event_attr' */
@@ -466,7 +472,8 @@ struct perf_event_attr {
 				sigtrap        :  1, /* send synchronous SIGTRAP on event */
 				defer_callchain:  1, /* request PERF_RECORD_CALLCHAIN_DEFERRED records */
 				defer_output   :  1, /* output PERF_RECORD_CALLCHAIN_DEFERRED records */
-				__reserved_1   : 24;
+				reference      :  1, /* pinned event serves as refclock timebase */
+				__reserved_1   : 23;
 
 	union {
 		__u32		wakeup_events;	  /* wake up every n events */
