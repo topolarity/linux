@@ -2713,7 +2713,7 @@ static void __perf_event_disable(struct perf_event *event,
  * is the current context on this CPU and preemption is disabled,
  * hence we can't get into perf_event_task_sched_out for this context.
  */
-static void _perf_event_disable(struct perf_event *event)
+static void _perf_event_disable(struct perf_event *event, void *data)
 {
 	struct perf_event_context *ctx = event->ctx;
 
@@ -2741,7 +2741,7 @@ void perf_event_disable(struct perf_event *event)
 	struct perf_event_context *ctx;
 
 	ctx = perf_event_ctx_lock(event);
-	_perf_event_disable(event);
+	_perf_event_disable(event, NULL);
 	perf_event_ctx_unlock(event, ctx);
 }
 EXPORT_SYMBOL_GPL(perf_event_disable);
@@ -3274,14 +3274,13 @@ static void __perf_event_enable(struct perf_event *event,
  * perf_event_for_each_child or perf_event_for_each as described
  * for perf_event_disable.
  */
-static void _perf_event_enable(struct perf_event *event)
+static void _perf_event_enable(struct perf_event *event, void *data)
 {
 	struct perf_event_context *ctx = event->ctx;
 
 	raw_spin_lock_irq(&ctx->lock);
 	if (event->state >= PERF_EVENT_STATE_INACTIVE ||
 	    event->state <  PERF_EVENT_STATE_ERROR) {
-out:
 		raw_spin_unlock_irq(&ctx->lock);
 		return;
 	}
@@ -3293,15 +3292,9 @@ out:
 	 * has gone back into error state, as distinct from the task having
 	 * been scheduled away before the cross-call arrived.
 	 */
-	if (event->state == PERF_EVENT_STATE_ERROR) {
-		/*
-		 * Detached SIBLING events cannot leave ERROR state.
-		 */
-		if (event->event_caps & PERF_EV_CAP_SIBLING &&
-		    event->group_leader == event)
-			goto out;
-
-		event->state = PERF_EVENT_STATE_OFF;
+	if (!perf_event_prepare_enable(event)) {
+		raw_spin_unlock_irq(&ctx->lock);
+		return;
 	}
 	raw_spin_unlock_irq(&ctx->lock);
 
@@ -3316,7 +3309,7 @@ void perf_event_enable(struct perf_event *event)
 	struct perf_event_context *ctx;
 
 	ctx = perf_event_ctx_lock(event);
-	_perf_event_enable(event);
+	_perf_event_enable(event, NULL);
 	perf_event_ctx_unlock(event, ctx);
 }
 EXPORT_SYMBOL_GPL(perf_event_enable);
@@ -3436,7 +3429,7 @@ static int _perf_event_refresh(struct perf_event *event, int refresh)
 		return -EINVAL;
 
 	atomic_add(refresh, &event->event_limit);
-	_perf_event_enable(event);
+	_perf_event_enable(event, NULL);
 
 	return 0;
 }
@@ -3462,12 +3455,12 @@ static int perf_event_modify_breakpoint(struct perf_event *bp,
 {
 	int err;
 
-	_perf_event_disable(bp);
+	_perf_event_disable(bp, NULL);
 
 	err = modify_user_hw_breakpoint_check(bp, attr, true);
 
 	if (!bp->attr.disabled)
-		_perf_event_enable(bp);
+		_perf_event_enable(bp, NULL);
 
 	return err;
 }
@@ -6310,7 +6303,7 @@ static __poll_t perf_poll(struct file *file, poll_table *wait)
 	return events;
 }
 
-static void _perf_event_reset(struct perf_event *event)
+static void _perf_event_reset(struct perf_event *event, void *data)
 {
 	(void)perf_event_read(event, false);
 	local64_set(&event->count, 0);
@@ -6325,7 +6318,7 @@ u64 perf_event_pause(struct perf_event *event, bool reset)
 
 	ctx = perf_event_ctx_lock(event);
 	WARN_ON_ONCE(event->attr.inherit);
-	_perf_event_disable(event);
+	_perf_event_disable(event, NULL);
 	count = local64_read(&event->count);
 	if (reset)
 		local64_set(&event->count, 0);
@@ -6474,21 +6467,23 @@ static void mediated_pmu_unaccount_event(struct perf_event *event) {}
  * task existence requirements of perf_event_enable/disable.
  */
 static void perf_event_for_each_child(struct perf_event *event,
-					void (*func)(struct perf_event *))
+				      void (*func)(struct perf_event *, void *),
+				      void *data)
 {
 	struct perf_event *child;
 
 	WARN_ON_ONCE(event->ctx->parent_ctx);
 
 	mutex_lock(&event->child_mutex);
-	func(event);
+	func(event, data);
 	list_for_each_entry(child, &event->child_list, child_list)
-		func(child);
+		func(child, data);
 	mutex_unlock(&event->child_mutex);
 }
 
 static void perf_event_for_each(struct perf_event *event,
-				  void (*func)(struct perf_event *))
+				void (*func)(struct perf_event *, void *),
+				void *data)
 {
 	struct perf_event_context *ctx = event->ctx;
 	struct perf_event *sibling;
@@ -6497,9 +6492,9 @@ static void perf_event_for_each(struct perf_event *event,
 
 	event = event->group_leader;
 
-	perf_event_for_each_child(event, func);
+	perf_event_for_each_child(event, func, data);
 	for_each_sibling_event(sibling, event)
-		perf_event_for_each_child(sibling, func);
+		perf_event_for_each_child(sibling, func, data);
 }
 
 static void __perf_event_period(struct perf_event *event,
@@ -6598,7 +6593,7 @@ static int __perf_event_set_bpf_prog(struct perf_event *event,
 
 static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned long arg)
 {
-	void (*func)(struct perf_event *);
+	void (*func)(struct perf_event *, void *);
 	u32 flags = arg;
 
 	if (event->state <= PERF_EVENT_STATE_REVOKED)
@@ -6701,9 +6696,9 @@ static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned lon
 	}
 
 	if (flags & PERF_IOC_FLAG_GROUP)
-		perf_event_for_each(event, func);
+		perf_event_for_each(event, func, NULL);
 	else
-		perf_event_for_each_child(event, func);
+		perf_event_for_each_child(event, func, NULL);
 
 	return 0;
 }
@@ -6748,17 +6743,213 @@ static long perf_compat_ioctl(struct file *file, unsigned int cmd,
 # define perf_compat_ioctl NULL
 #endif
 
-int perf_event_task_enable(void)
+/*
+ * Batch IPI infrastructure for perf_event_task_disable/enable.
+ *
+ * When a task owns events targeting other threads (opened via
+ * perf_event_open(attr, tid, ...)), the original implementation disables
+ * each event individually via event_function_call(), which sends one
+ * synchronous IPI per event.  For N events this means N sequential IPI
+ * round-trips at ~5-10us each.
+ *
+ * This optimization uses per-event flags as the communication mechanism:
+ * the calling CPU marks events via pending_toggle_batch, broadcasts a
+ * single parallel IPI via smp_call_function_many(), and each handler
+ * walks its local active context looking for marked events.
+ *
+ * Events already handled by the IPI are in the OFF/INACTIVE state when
+ * the existing per-event cleanup pass runs, so _perf_event_disable /
+ * _perf_event_enable returns immediately for them (no IPI sent).
+ */
+
+/* Action: set the batch flag and add a running event's CPU to the cpumask */
+static void perf_event_mark_batch(struct perf_event *event, void *data)
 {
-	struct perf_event_context *ctx;
+	struct cpumask *mask = data;
+	struct task_struct *task;
+
+	event->pending_toggle_batch = 1;
+
+	task = READ_ONCE(event->ctx->task);
+	if (task && task != TASK_TOMBSTONE && task_curr(task))
+		cpumask_set_cpu(task_cpu(task), mask);
+}
+
+/* Action: clear the batch flag on a single event */
+static void perf_event_clear_batch(struct perf_event *event, void *data)
+{
+	event->pending_toggle_batch = 0;
+}
+
+/*
+ * Clear ERROR state so that __perf_event_enable() will proceed.
+ * Without this, __perf_event_enable() sees state <= ERROR and returns.
+ * Detached siblings must remain in ERROR state.
+ *
+ * Must be called under ctx->lock.  Returns true if the event can
+ * be enabled, false if it should be skipped.
+ */
+static bool perf_event_prepare_enable(struct perf_event *event)
+{
+	if (event->state == PERF_EVENT_STATE_ERROR) {
+		/* Detached SIBLING events cannot leave ERROR state */
+		if (event->event_caps & PERF_EV_CAP_SIBLING &&
+		    event->group_leader == event)
+			return false;
+		event->state = PERF_EVENT_STATE_OFF;
+	}
+	return true;
+}
+
+/*
+ * Action: toggle a single event under the context spinlock.
+ *
+ * For enable: clears ERROR state if needed, then delegates to
+ *             __perf_event_enable() which handles all other states.
+ * For disable: delegates to __perf_event_disable() which checks state.
+ */
+static void perf_event_batch_toggle_one(struct perf_event *event,
+					struct perf_cpu_context *cpuctx,
+					struct perf_event_context *ctx,
+					bool enable)
+{
+	if (enable) {
+		if (!perf_event_prepare_enable(event))
+			return;
+		__perf_event_enable(event, cpuctx, ctx, NULL);
+	} else {
+		__perf_event_disable(event, cpuctx, ctx, NULL);
+	}
+}
+
+/*
+ * IPI handler for smp_call_function_many().  Runs with IRQs disabled
+ * on each target CPU.  Walks the local active task context's event_list
+ * and processes any event with pending_toggle_batch set.
+ *
+ * info encodes the operation: 0 = disable, 1 = enable.
+ */
+static void perf_event_task_batch_ipi(void *info)
+{
+	bool enable = (bool)(unsigned long)info;
+	struct perf_cpu_context *cpuctx = this_cpu_ptr(&perf_cpu_context);
+	struct perf_event_context *task_ctx = cpuctx->task_ctx;
 	struct perf_event *event;
 
-	mutex_lock(&current->perf_event_mutex);
+	lockdep_assert_irqs_disabled();
+
+	if (!task_ctx)
+		return;
+
+	perf_ctx_lock(cpuctx, task_ctx);
+
+	list_for_each_entry(event, &task_ctx->event_list, event_entry) {
+		if (!event->pending_toggle_batch)
+			continue;
+
+		perf_event_batch_toggle_one(event, cpuctx, task_ctx, enable);
+		event->pending_toggle_batch = 0;
+	}
+
+	perf_ctx_unlock(cpuctx, task_ctx);
+}
+
+/*
+ * Iterate all events owned by the current task and call func on each
+ * event and its inherited children, with proper context locking.
+ *
+ * perf_event_mutex must be held by the caller.
+ */
+static void perf_event_for_each_owner(void (*func)(struct perf_event *, void *),
+				      void *data)
+{
+	struct perf_event *event;
+	struct perf_event_context *ctx;
+
+	lockdep_assert_held(&current->perf_event_mutex);
+
 	list_for_each_entry(event, &current->perf_event_list, owner_entry) {
 		ctx = perf_event_ctx_lock(event);
-		perf_event_for_each_child(event, _perf_event_enable);
+		perf_event_for_each_child(event, func, data);
 		perf_event_ctx_unlock(event, ctx);
 	}
+}
+
+/*
+ * Common implementation for perf_event_task_disable/enable with
+ * parallel IPI batching.
+ *
+ * Phase 1: Flag events (parent + children) with pending_toggle_batch
+ *          and build a cpumask of CPUs running target tasks.
+ * Phase 2: Parallel IPI broadcast via smp_call_function_many().
+ *          Each handler walks its local task context and processes
+ *          flagged events.
+ * Cleanup: Run the original per-event path via perf_event_for_each_owner.
+ *          Events already handled by the IPI (now OFF/INACTIVE) return
+ *          immediately — no IPI sent.  Remaining events (local CPU,
+ *          non-running tasks, migration stragglers) are handled normally.
+ *          Then clear all batch flags.
+ *
+ * On cpumask allocation failure, the cleanup pass alone is equivalent
+ * to the original implementation.
+ */
+static void __perf_event_task_toggle(bool enable)
+{
+	void (*event_fn)(struct perf_event *, void *) =
+		enable ? _perf_event_enable : _perf_event_disable;
+	struct perf_event *event;
+	cpumask_var_t target_cpus;
+
+	lockdep_assert_held(&current->perf_event_mutex);
+
+	if (alloc_cpumask_var(&target_cpus, GFP_KERNEL)) {
+		/*
+		 * Phase 1: Flag events and build cpumask.
+		 *
+		 * perf_event_mutex is held, which prevents event->ctx
+		 * from changing and prevents new children from appearing.
+		 */
+		cpumask_clear(target_cpus);
+
+		list_for_each_entry(event, &current->perf_event_list,
+				    owner_entry)
+			perf_event_for_each_child(event,
+						  perf_event_mark_batch,
+						  target_cpus);
+
+		/* Ensure flag writes are visible to IPI handlers */
+		smp_mb();
+
+		/*
+		 * Phase 2: Parallel IPI broadcast.
+		 *
+		 * No ctx->mutex needed: the IPI handler uses only the
+		 * context spinlock (same as event_function()), and
+		 * perf_event_mutex prevents structural changes.
+		 */
+		cpumask_clear_cpu(smp_processor_id(), target_cpus);
+
+		if (!cpumask_empty(target_cpus))
+			smp_call_function_many(target_cpus,
+					       perf_event_task_batch_ipi,
+					       (void *)(unsigned long)enable,
+					       1);
+
+		free_cpumask_var(target_cpus);
+	}
+
+	/* Cleanup: existing per-event path handles the rest */
+	perf_event_for_each_owner(event_fn, NULL);
+
+	/* Clear batch flags on parents and children */
+	list_for_each_entry(event, &current->perf_event_list, owner_entry)
+		perf_event_for_each_child(event, perf_event_clear_batch, NULL);
+}
+
+int perf_event_task_enable(void)
+{
+	mutex_lock(&current->perf_event_mutex);
+	__perf_event_task_toggle(true);
 	mutex_unlock(&current->perf_event_mutex);
 
 	return 0;
@@ -6766,15 +6957,8 @@ int perf_event_task_enable(void)
 
 int perf_event_task_disable(void)
 {
-	struct perf_event_context *ctx;
-	struct perf_event *event;
-
 	mutex_lock(&current->perf_event_mutex);
-	list_for_each_entry(event, &current->perf_event_list, owner_entry) {
-		ctx = perf_event_ctx_lock(event);
-		perf_event_for_each_child(event, _perf_event_disable);
-		perf_event_ctx_unlock(event, ctx);
-	}
+	__perf_event_task_toggle(false);
 	mutex_unlock(&current->perf_event_mutex);
 
 	return 0;
@@ -11828,7 +12012,7 @@ static void perf_addr_filter_apply(struct perf_addr_filter *filter,
  * Update event's address range filters based on the
  * task's existing mappings, if any.
  */
-static void perf_event_addr_filters_apply(struct perf_event *event)
+static void perf_event_addr_filters_apply(struct perf_event *event, void *data)
 {
 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
 	struct task_struct *task = READ_ONCE(event->ctx->task);
@@ -12118,7 +12302,7 @@ perf_event_set_addr_filter(struct perf_event *event, char *filter_str)
 	perf_addr_filters_splice(event, &filters);
 
 	/* install new filters */
-	perf_event_for_each_child(event, perf_event_addr_filters_apply);
+	perf_event_for_each_child(event, perf_event_addr_filters_apply, NULL);
 
 	return ret;
 

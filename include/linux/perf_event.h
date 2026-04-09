@@ -881,6 +881,13 @@ struct perf_event {
 	struct callback_head		pending_task;
 	unsigned int			pending_work;
 
+	/*
+	 * Flag for batched PR_TASK_PERF_EVENTS_DISABLE/ENABLE.
+	 * Set by the calling task under perf_event_mutex, read and
+	 * cleared by IPI handlers under the context spinlock.
+	 */
+	unsigned int			pending_toggle_batch;
+
 	atomic_t			event_limit;
 
 	/* address range filters */
